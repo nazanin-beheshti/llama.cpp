@@ -62,12 +62,41 @@ static ov::Output<ov::Node> reshape_flat_kv(const ov::Output<ov::Node> & kv_flat
 }
 
 OutputVector translate_flash_attn_ext(const NodeContext & context) {
-    num_inputs_check(context, 3, 4);
-    const bool has_mask = context.get_input_size() == 4;
+    num_inputs_check(context, 3, 5);
+
+    bool has_mask = false;
+    bool has_sink = false;
+    bool has_scale = false;
+    ov::Output<ov::Node> sink;
+
+    if (context.get_input_names()[3].find("mask") != std::string::npos) {
+        has_mask = true;
+    }
+    if (context.get_input_names()[4].find("sink") != std::string::npos) {
+        has_sink = true;
+        sink = context.get_input(4);
+    }
+    else if (context.get_input_names()[4].find("scale") != std::string::npos) {
+        has_scale = true;
+        auto scale_node = context.get_input(4);
+    }
+
+
+    std::cout << "[flash_attn_ext] has_mask: " << has_mask << '\n';
+    std::cout << "[flash_attn_ext] has_sink: " << has_sink << '\n';
+
+
     auto q_f32 = context.get_input(0);
     auto k = context.get_input(1);
     auto v = context.get_input(2);
     const int op_case = context.get_op_case();
+
+    std::cout << "[flash_attn_ext] context name: " << context.get_name() << '\n';
+    std::cout << "[flash_attn_ext] op_case: " << context.get_op_case() << '\n';
+    std::cout << "[flash_attn_ext] input_size: " << context.get_input_size() << '\n';
+    for (size_t i = 0; i < context.get_input_size(); ++i) {
+        std::cout << "[flash_attn_ext] input[" << i << "] name: " << context.get_input_names()[i] << '\n';
+    }
 
     if (op_case == 1 || op_case == 2) {
         int64_t n_state_head = (int64_t) context.get_view_input_ggml_shape(1, 0)[3];
@@ -86,6 +115,10 @@ OutputVector translate_flash_attn_ext(const NodeContext & context) {
 
     float * params = reinterpret_cast<float *>(context.get_output_op_params());
     float scale = params[0];
+    if (has_sink && !has_scale) {
+        scale = 1.0f;
+    }
+
     // float max_bias      = params[1];
     // float logit_softcap = params[2];
 
@@ -108,6 +141,14 @@ OutputVector translate_flash_attn_ext(const NodeContext & context) {
         if (mask.get_element_type() != ov::element::f16) {
             mask = std::make_shared<ov::op::v0::Convert>(mask, ov::element::f16);
         }
+    }
+
+    if (has_sink) {
+        if (sink.get_element_type() != q->get_element_type()) {
+            sink = std::make_shared<ov::op::v0::Convert>(sink, q->get_element_type());
+        }
+        sink = std::make_shared<ov::op::v1::Reshape>(
+            sink, ov::op::v0::Constant::create(ov::element::i64, {4}, std::vector<int64_t>{1, -1, 1, 1}), false);
     }
 
     //auto tile_kv = [&](int64_t num_heads, int64_t num_heads_kv, int64_t head_size, ov::Output<Node> kv) {
@@ -234,7 +275,17 @@ OutputVector translate_flash_attn_ext(const NodeContext & context) {
     }
 
     constexpr auto causal = false;
-    if (has_mask) {
+    if (has_mask && has_sink) {
+        std::cout << "[flash_attn_ext] returning SDPA with mask and sink\n";
+        auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, v, mask, scale_node, sink, causal);
+        res = std::make_shared<ov::op::v1::Transpose>(
+            sdpa, ov::op::v0::Constant::create(ov::element::i64, {4}, {0, 2, 1, 3}));
+        /*auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, v, mask, scale_node, causal);
+        res = std::make_shared<ov::op::v1::Transpose>(
+            sdpa, ov::op::v0::Constant::create(ov::element::i64, {4}, {0, 2, 1, 3}));*/
+
+    }
+    else if (has_mask) {
         auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(q, k, v, mask, scale_node, causal);
         res = std::make_shared<ov::op::v1::Transpose>(
             sdpa, ov::op::v0::Constant::create(ov::element::i64, {4}, {0, 2, 1, 3}));
